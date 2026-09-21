@@ -91,11 +91,12 @@ asset serving:
 uv run pytest -q
 ```
 
-Tests default to a scratch database at `/tmp/agent-relay-test.db` so they
-don't reset your dev server's `./agent-relay.db`. The fixture drops and
-recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
-the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
-running tests against another database.
+Tests always use a unique temporary SQLite file, overriding
+`RELAY_DATABASE_URL` before importing the app. The existing reset fixture
+only drops and recreates tables in that temporary database, which is removed
+after the test session; your dev server's `./agent-relay.db` is untouched.
+The focused acceptance test registers two agents, sends a task, claims and
+completes it as the recipient, and retrieves the completed result as the sender.
 
 This starter intentionally does not include Docker, Kubernetes, CI, external
 brokers, an LLM, or a PostgreSQL implementation. Those are deployment and

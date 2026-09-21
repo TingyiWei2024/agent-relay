@@ -9,11 +9,12 @@ not from a Python lock.
 from __future__ import annotations
 
 import os
+from tempfile import TemporaryDirectory
 
-# Default to a scratch DB so `pytest` never resets the dev server's
-# `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
-# (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
+# Configure a unique, real SQLite file before importing the application, which
+# creates its engine and schema at import time. Never reset a caller's database.
+_test_database = TemporaryDirectory(prefix="agent-relay-test-")
+os.environ["RELAY_DATABASE_URL"] = f"sqlite:///{_test_database.name}/relay.db"
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -26,10 +27,16 @@ from database import Attempt, Base, Task, as_db_time, db_session, engine, utcnow
 from storage import claim_one
 
 
+@pytest.fixture(scope="session", autouse=True)
+def isolated_database():
+    yield
+    engine.dispose()
+    _test_database.cleanup()
+
+
 @pytest.fixture(autouse=True)
-def empty_database():
-    # Resets whatever DB RELAY_DATABASE_URL points at. Defaults to the
-    # scratch /tmp file above; never run against a DB with data you need.
+def empty_database(isolated_database):
+    # Reset only the temporary SQLite database configured above.
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield
@@ -41,6 +48,81 @@ def register(client: TestClient, name: str) -> tuple[dict, dict[str, str]]:
     assert response.status_code == 201
     data = response.json()
     return data, {"Authorization": f"Bearer {data['token']}"}
+
+
+def test_two_agents_send_claim_complete_and_sender_retrieves_result():
+    """SPEC acceptance scenario 1, through the real API and SQLite storage."""
+    task_input = "hello relay from agent A"
+    task_output = "HELLO RELAY FROM AGENT A"
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "Agent A")
+        recipient, recipient_headers = register(client, "Agent B")
+        sender_id = sender["agent_id"]
+        recipient_id = recipient["agent_id"]
+        assert sender_id != recipient_id
+
+        sent = client.post(
+            "/api/v1/tasks",
+            headers=sender_headers,
+            json={"to": recipient_id, "input": task_input},
+        )
+        assert sent.status_code == 201
+        task_id = sent.json()["task_id"]
+        assert sent.json()["status"] == "queued"
+        task_path = f"/api/v1/tasks/{task_id}"
+
+        queued = client.get(task_path, headers=sender_headers)
+        assert queued.status_code == 200
+        queued_task = queued.json()
+        assert queued_task["task_id"] == task_id
+        assert queued_task["from"] == sender_id
+        assert queued_task["to"] == recipient_id
+        assert queued_task["input"] == task_input
+        assert queued_task["status"] == "queued"
+        assert queued_task["output"] is None
+        assert queued_task["error"] is None
+        assert queued_task["finished_at"] is None
+
+        claimed = client.post(
+            "/api/v1/tasks/claim",
+            headers=recipient_headers,
+            json={"worker_id": "acceptance-worker-b", "wait_seconds": 0},
+        )
+        assert claimed.status_code == 200
+        claim = claimed.json()
+        claim_token = claim.pop("claim_token")
+        assert bool(claim_token)
+        assert claim["task_id"] == task_id
+        assert claim["from"] == sender_id
+        assert claim["input"] == task_input
+        assert claim["attempt"] == 1
+        assert claim["lease_expires_at"]
+
+        processing = client.get(task_path, headers=sender_headers)
+        assert processing.status_code == 200
+        assert processing.json()["status"] == "processing"
+        assert processing.json()["attempt_count"] == 1
+
+        completed = client.post(
+            f"{task_path}/complete",
+            headers=recipient_headers,
+            json={"claim_token": claim_token, "output": task_output},
+        )
+        assert completed.status_code == 200
+        assert completed.json() == {"task_id": task_id, "status": "completed"}
+
+        retrieved = client.get(task_path, headers=sender_headers)
+        assert retrieved.status_code == 200
+        result = retrieved.json()
+        assert result["task_id"] == task_id
+        assert result["from"] == sender_id
+        assert result["to"] == recipient_id
+        assert result["input"] == task_input
+        assert result["status"] == "completed"
+        assert result["output"] == task_output
+        assert result["error"] is None
+        assert result["attempt_count"] == 1
+        assert result["finished_at"] is not None
 
 
 def test_protocol_idempotency_terminal_retry_and_auth_boundary():
