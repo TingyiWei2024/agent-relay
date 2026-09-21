@@ -1,0 +1,17 @@
+# Only these build inputs enter the Docker context. This excludes .git, local
+# environments/caches, SQLite files and sidecars, .env, and worker credentials.
+**
+!Dockerfile
+!.dockerignore
+!.python-version
+!pyproject.toml
+!uv.lock
+!README.md
+!main.py
+!database.py
+!storage.py
+!schemas.py
+!errors.py
+!worker.py
+!dashboard.py
+!dashboard.html
