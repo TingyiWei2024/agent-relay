@@ -1,9 +1,8 @@
 """Persistence operations for Agent Relay.
 
 Routes and the worker call these functions instead of issuing SQL directly.
-Claim, heartbeat, terminal submission, and recovery each use the same atomic
-SQLite transaction seam, which is the one area students will later replace by
-PostgreSQL row-locking operations.
+Claim, heartbeat, terminal submission, and recovery coordinate through database
+transactions and task row locks (or SQLite's writer reservation).
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ from database import (
     as_db_time,
     db_session,
     db_time,
-    immediate_transaction,
+    write_transaction,
     iso_time,
     recover_expired,
     recover_expired_in_session,
@@ -77,7 +76,7 @@ def authenticate(token: str) -> Agent:
     # last_seen_at is an authenticated observation and therefore a write.  Use
     # the same writer boundary as task operations so concurrent workers do not
     # hold stale WAL snapshots while trying to update it.
-    with immediate_transaction() as db:
+    with write_transaction() as db:
         agent = db.scalar(select(Agent).where(Agent.token_hash == token_digest))
         if agent is None or not hmac.compare_digest(agent.token_hash, token_digest):
             raise RelayError("invalid_credentials", "The agent token is invalid.", 401)
@@ -106,7 +105,12 @@ def list_agents(limit: int, cursor: tuple[datetime, str] | None) -> tuple[list[A
 def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_key: str | None) -> dict[str, str]:
     # Serializing task creation makes the sender-scoped idempotency check and
     # unique constraint one operation even when two API processes race.
-    with immediate_transaction() as db:
+    with write_transaction() as db:
+        if idempotency_key is not None:
+            # PostgreSQL FOR NO KEY UPDATE serializes each sender's key check
+            # without blocking FK KEY SHARE locks from concurrent A->B/B->A
+            # inserts. SQLAlchemy omits this clause on SQLite.
+            db.scalar(select(Agent).where(Agent.id == sender_id).with_for_update(key_share=True))
         recipient = db.get(Agent, recipient_id)
         if recipient is None:
             raise RelayError("not_found", "Recipient agent not found.", 404)
@@ -141,17 +145,18 @@ def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_
 
 
 def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
-    with immediate_transaction() as db:
-        now = utcnow()
-        recover_expired_in_session(db, now)
+    with write_transaction() as db:
+        recover_expired_in_session(db)
         task = db.scalar(
             select(Task)
             .where(Task.recipient_id == agent_id, Task.status == "queued")
             .order_by(Task.created_at, Task.id)
             .limit(1)
+            .with_for_update(skip_locked=True)
         )
         if task is None:
             return None
+        now = utcnow()
         if task.attempt_count >= MAX_ATTEMPTS:
             task.status = "failed"
             task.error = "attempts_exhausted"
@@ -194,8 +199,8 @@ def _find_attempt_for_token(db: Session, task_id: str, token: str) -> Attempt | 
 
 
 def heartbeat(task_id: str, agent_id: str, claim_token: str) -> str:
-    with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+    with write_transaction() as db:
+        task = db.scalar(select(Task).where(Task.id == task_id).with_for_update())
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
         attempt = _find_attempt_for_token(db, task_id, claim_token)
@@ -221,8 +226,8 @@ def commit_terminal(
     action: Literal["complete", "fail"],
     value: str,
 ) -> dict[str, str]:
-    with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+    with write_transaction() as db:
+        task = db.scalar(select(Task).where(Task.id == task_id).with_for_update())
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
         attempt = _find_attempt_for_token(db, task_id, claim_token)

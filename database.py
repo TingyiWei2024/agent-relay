@@ -1,10 +1,4 @@
-"""SQLite database setup and durable Agent Relay models.
-
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
-"""
+"""PostgreSQL/SQLite setup, durable models, and lease recovery transactions."""
 
 from __future__ import annotations
 
@@ -176,20 +170,21 @@ def db_session() -> Generator[Session, None, None]:
 
 
 @contextmanager
-def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+def write_transaction() -> Generator[Session, None, None]:
+    """Reserve SQLite's writer, or use a PostgreSQL transaction with row locks.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    PostgreSQL callers lock the relevant Task before reading its Attempt.
+    SQLite ignores FOR UPDATE; BEGIN IMMEDIATE provides its equivalent writer
+    coordination across processes. Both backends commit task and attempt together.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if engine.dialect.name == "sqlite":
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        else:
+            connection.begin()
         yield session
         session.flush()
         connection.commit()
@@ -201,21 +196,38 @@ def immediate_transaction() -> Generator[Session, None, None]:
         connection.close()
 
 
-def recover_expired_in_session(db: Session, now: datetime) -> int:
+def recover_expired_in_session(db: Session) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
-    now_db = as_db_time(now)
-    expired = list(
+    cutoff = as_db_time(utcnow())
+    # Lock tasks first, just like heartbeat and terminal submission. The EXISTS
+    # only selects candidates: read the current attempt after owning its task.
+    # SKIP LOCKED lets other recovery/claim transactions make progress safely.
+    expired_tasks = list(
         db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
+            select(Task)
+            .where(
+                Task.status == "processing",
+                select(Attempt.id).where(
+                    Attempt.task_id == Task.id,
+                    Attempt.outcome == "processing",
+                    Attempt.lease_expires_at <= cutoff,
+                ).exists(),
+            )
+            .order_by(Task.created_at, Task.id)
+            .with_for_update(skip_locked=True)
         )
     )
     count = 0
-    for attempt in expired:
-        task = db.get(Task, attempt.task_id)
-        if task is None or attempt.outcome != "processing":
+    for task in expired_tasks:
+        now_db = as_db_time(utcnow())
+        attempt = db.scalar(select(Attempt).where(
+            Attempt.task_id == task.id,
+            Attempt.attempt_number == task.attempt_count,
+            Attempt.outcome == "processing",
+            Attempt.lease_expires_at <= now_db,
+        ))
+        if attempt is None:
             continue
         attempt.outcome = "expired"
         attempt.finished_at = now_db
@@ -235,8 +247,8 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
 def recover_expired() -> int:
     """Run one recovery pass and return the number of expired attempts."""
 
-    with immediate_transaction() as db:
-        return recover_expired_in_session(db, utcnow())
+    with write_transaction() as db:
+        return recover_expired_in_session(db)
 
 
 __all__ = [
@@ -255,7 +267,7 @@ __all__ = [
     "db_session",
     "db_time",
     "engine",
-    "immediate_transaction",
+    "write_transaction",
     "init_db",
     "iso_time",
     "recover_expired",

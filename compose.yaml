@@ -1,0 +1,29 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      RELAY_DATABASE_URL: postgresql+psycopg://relay:relay-local-only@postgres:5432/agent_relay
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17.11-bookworm
+    environment:
+      # Public homework-only credentials, not personal or production secrets.
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay-local-only
+      POSTGRES_DB: agent_relay
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+volumes:
+  postgres-data:
