@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: agent-relay
+data:
+  POSTGRES_USER: relay
+  POSTGRES_DB: agent_relay
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-local
+  namespace: agent-relay
+type: Opaque
+stringData:
+  # Public local-homework defaults, never personal or production credentials.
+  POSTGRES_PASSWORD: relay-local-only
+  RELAY_DATABASE_URL: postgresql+psycopg://relay:relay-local-only@postgres:5432/agent_relay

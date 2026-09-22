@@ -6,6 +6,195 @@ PostgreSQL; the self-contained local and single-container modes still support
 SQLite. Workers execute tasks on their own machines. The included worker
 deterministically returns `input.upper()`.
 
+## Run with PostgreSQL and local kind (Stage D)
+
+Start Docker Desktop/the Docker engine and make host port 8000 available.
+From the repository root, check the installed tools before continuing:
+
+```bash
+docker --version
+docker info
+kind version
+kubectl version --client
+kind get clusters
+```
+
+If a tool is missing, install it separately before proceeding. On macOS, the
+Docker Desktop CLI can be used in this terminal with
+`export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"`.
+Use the dedicated cluster name `agent-relay`; if that name already belongs to
+another project, choose a different name consistently in the commands below.
+These commands use a separate temporary kubeconfig and do not change the
+default kubeconfig or another cluster's context:
+
+```bash
+export RELAY_KIND_DIR="$(mktemp -d /tmp/agent-relay-kind.XXXXXX)"
+export KUBECONFIG="$RELAY_KIND_DIR/kubeconfig"
+kind create cluster --name agent-relay \
+  --image kindest/node:v1.32.11@sha256:5fc52d52a7b9574015299724bd68f183702956aa4a2116ae75a63cb574b35af8 \
+  --kubeconfig "$KUBECONFIG" --wait 120s
+kubectl --context kind-agent-relay wait --for=condition=Ready nodes --all --timeout=120s
+docker build -t agent-relay:kind .
+kind load docker-image agent-relay:kind --name agent-relay
+kubectl --context kind-agent-relay apply -f k8s/
+kubectl --context kind-agent-relay -n agent-relay rollout status statefulset/postgres --timeout=180s
+kubectl --context kind-agent-relay -n agent-relay rollout status deployment/agent-relay --timeout=180s
+kubectl --context kind-agent-relay -n agent-relay wait --for=condition=Ready pod --all --timeout=120s
+kubectl --context kind-agent-relay -n agent-relay get deployments,statefulsets,pods,services,pvc
+kubectl --context kind-agent-relay -n agent-relay get endpoints
+kubectl --context kind-agent-relay get storageclass,pv
+```
+
+The pinned node image is published in the [kind v0.31 release](https://github.com/kubernetes-sigs/kind/releases/tag/v0.31.0).
+Kubernetes 1.32 keeps this local exercise compatible with the installed
+kubectl 1.32 client; [kubectl must stay within one minor version of the API server](https://kubernetes.io/releases/version-skew-policy/#kubectl).
+This is a local homework configuration, not a production version recommendation.
+The application image uses the accepted Dockerfile. Both the app and its init
+container specify `imagePullPolicy: Never`, so forgetting `kind load` produces
+an explicit image error instead of a remote registry pull. PostgreSQL and the
+kind node image may require registry access on their first use. After rebuilding
+the same app tag, load it again and restart the Deployment to use the new image.
+
+All application resources live in namespace `agent-relay`:
+
+| Resource | Name and purpose |
+| --- | --- |
+| Deployment | `agent-relay`, one replica, `Recreate` updates |
+| Service | `agent-relay`, internal ClusterIP, port 8000 |
+| StatefulSet | `postgres`, one replica (`postgres-0`), PostgreSQL 17.11 |
+| Service | `postgres`, headless stable DNS, port 5432 |
+| ConfigMap / Secret | `postgres-config` / `postgres-local`, local database settings |
+| PVC | `postgres-data-postgres-0`, 1 GiB, ReadWriteOnce, `standard` StorageClass |
+
+The app connects through SQLAlchemy/psycopg to
+`postgresql+psycopg://relay:relay-local-only@postgres:5432/agent_relay`.
+`postgres` resolves the PostgreSQL Service within the namespace; `localhost`
+would incorrectly address the app Pod. The checked-in Secret contains public
+homework defaults, not personal credentials. It is not a production secret
+management system. No PostgreSQL host port or public load balancer is created.
+
+An init container uses the app's existing dependencies to wait for a successful
+database connection before app import initializes tables. PostgreSQL readiness
+runs `pg_isready` every two seconds. App readiness calls the existing `/ready`
+every two seconds with a three-second timeout; it queries the actual database
+tables. The independent `/health` liveness probe checks the API process. Check
+actual Ready conditions, rollout success, Service endpoints and a Bound PVC;
+successful `apply` alone does not prove readiness. One app replica and Recreate
+updates keep this starter simple, with brief downtime during replacement.
+
+### Port forwarding and real acceptance
+
+Keep the following process running in the cluster terminal:
+
+```bash
+kubectl --context kind-agent-relay -n agent-relay port-forward --address 127.0.0.1 service/agent-relay 8000:8000
+```
+
+Open <http://127.0.0.1:8000/>. In another terminal, verify:
+
+```bash
+curl --fail http://127.0.0.1:8000/health  # {"status":"ok"}
+curl --fail http://127.0.0.1:8000/ready   # {"status":"ready"}
+curl --fail http://127.0.0.1:8000/        # dashboard HTML
+```
+
+Follow the accepted `SPEC.md` flow through this real HTTP address: register
+distinct A and B, send nonempty input from A to B (`queued`), claim as B
+(`processing`), complete using B's bearer token and active claim token, then
+retrieve as A and confirm `completed` and the exact output. Retain A's token
+and task ID outside source control. Enter A's token in the dashboard, click
+**Use token**, and verify that same task, output, and completed delivery history.
+The host browser/worker reaches the app Service through port forwarding; the
+app reaches the PostgreSQL Pod through its Service and stores records on the PVC.
+
+For the remaining commands, use a terminal with the same `KUBECONFIG` value
+printed by `echo "$KUBECONFIG"` in the cluster terminal. Before registration,
+a **fresh cluster and PVC** must show zero agents, tasks and attempts:
+
+```bash
+kubectl --context kind-agent-relay -n agent-relay exec postgres-0 -- psql -U relay -d agent_relay -c 'SELECT (SELECT count(*) FROM agents) AS agents, (SELECT count(*) FROM tasks) AS tasks, (SELECT count(*) FROM attempts) AS attempts;'
+```
+
+After acceptance, directly confirm the same records in Kubernetes PostgreSQL
+without printing credential hashes:
+
+```bash
+kubectl --context kind-agent-relay -n agent-relay exec postgres-0 -- psql -U relay -d agent_relay -c 'SELECT current_database(), version();'
+kubectl --context kind-agent-relay -n agent-relay exec postgres-0 -- psql -U relay -d agent_relay -c 'SELECT id, name, created_at FROM agents;'
+kubectl --context kind-agent-relay -n agent-relay exec postgres-0 -- psql -U relay -d agent_relay -c 'SELECT id, sender_id, recipient_id, input, status, output, attempt_count, finished_at FROM tasks;'
+kubectl --context kind-agent-relay -n agent-relay exec postgres-0 -- psql -U relay -d agent_relay -c 'SELECT task_id, attempt_number, worker_id, outcome, claimed_at, lease_expires_at, finished_at FROM attempts;'
+kubectl --context kind-agent-relay -n agent-relay exec deployment/agent-relay -- python -c 'from database import engine; print(engine.url.render_as_string(hide_password=True))'
+```
+
+### Verify Pod replacement and regression
+
+Record Pod UIDs and the PVC UID/PV binding before replacement:
+
+```bash
+kubectl --context kind-agent-relay -n agent-relay get pods -o custom-columns=NAME:.metadata.name,UID:.metadata.uid
+kubectl --context kind-agent-relay -n agent-relay get pvc postgres-data-postgres-0 -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,PV:.spec.volumeName,STATUS:.status.phase
+kubectl --context kind-agent-relay -n agent-relay rollout restart deployment/agent-relay
+kubectl --context kind-agent-relay -n agent-relay rollout status deployment/agent-relay --timeout=120s
+```
+
+Restart port forwarding after the app Pod is replaced. Using the saved A token,
+retrieve the same task ID over HTTP and refresh the dashboard; both must show
+the identical completed result. Record the changed app Pod UID. Then replace
+only the PostgreSQL Pod, retaining its claim and volume:
+
+```bash
+kubectl --context kind-agent-relay -n agent-relay delete pod postgres-0
+kubectl --context kind-agent-relay -n agent-relay rollout status statefulset/postgres --timeout=180s
+kubectl --context kind-agent-relay -n agent-relay wait --for=condition=Ready pod --all --timeout=120s
+kubectl --context kind-agent-relay -n agent-relay get pods -o custom-columns=NAME:.metadata.name,UID:.metadata.uid
+kubectl --context kind-agent-relay -n agent-relay get pvc postgres-data-postgres-0 -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,PV:.spec.volumeName,STATUS:.status.phase
+```
+
+Confirm a changed PostgreSQL Pod UID but the **same PVC UID and PV binding**.
+Wait for `/ready` to return 200, retrieve the identical authenticated result,
+refresh the dashboard, and repeat the direct SQL checks. Temporary app readiness
+failures during database replacement are expected. Do not delete the PVC to
+test persistence. kind's local-path `standard` provisioner stores the volume
+inside the kind node: data survives Pod replacement, **not cluster deletion**.
+This single-node setup provides neither database replication nor backups.
+
+Run the unchanged SQLite regression suite and the accepted isolated PostgreSQL
+verifier (the latter uses a separate temporary schema and removes it afterward):
+
+```bash
+UV_FROZEN=1 uv run pytest -q
+kubectl --context kind-agent-relay -n agent-relay exec -i deployment/agent-relay -- python - < verify_postgres.py
+```
+
+Expect five SQLite tests and six PostgreSQL checks to pass. Confirm the public
+acceptance records remain unchanged after the verifier. These tests complement
+the real port-forwarded HTTP/browser acceptance; they do not replace it.
+
+### Clean up this local cluster
+
+Stop port forwarding with Ctrl-C. To stop workloads while retaining this
+cluster's PostgreSQL PVC, delete only the workload and Service manifests:
+
+```bash
+kubectl --context kind-agent-relay delete -f k8s/03-app.yaml -f k8s/02-postgres.yaml
+```
+
+Reapply `k8s/` to reuse the retained PVC. When all homework data can be discarded,
+delete **only** the dedicated cluster and its temporary kubeconfig:
+
+```bash
+kind delete cluster --name agent-relay --kubeconfig "$KUBECONFIG"
+rm -- "$KUBECONFIG"
+rmdir -- "$RELAY_KIND_DIR"
+unset KUBECONFIG RELAY_KIND_DIR
+```
+
+Cluster deletion destroys its PostgreSQL data. Deleting namespace `agent-relay`
+or its PVC also destroys the local volume; do not use `kubectl delete -f k8s/`
+when intending to preserve data. Stages A/B/C remain available unchanged.
+CI/CD, GitHub Actions, `act`, public cloud deployment and unrelated features
+are outside Stage D.
+
 ## Run with PostgreSQL and Compose (Stage C)
 
 Start Docker Desktop/the Docker engine. From the repository root, with host
@@ -298,5 +487,5 @@ commands. The tests use their own temporary SQLite file; they do not call
 the container, so the live HTTP verification above is also required.
 
 The Stage B single-container SQLite mode remains available alongside Stage C
-PostgreSQL Compose. Kubernetes, CI/CD, external brokers, and an LLM remain
-outside this project stage.
+PostgreSQL Compose and Stage D local Kubernetes. CI/CD, external brokers, and
+an LLM remain outside this project stage.

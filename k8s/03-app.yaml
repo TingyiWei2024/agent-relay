@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-relay
+  namespace: agent-relay
+spec:
+  replicas: 1
+  # Keep one API process during updates; brief downtime is fine locally.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-relay
+  template:
+    metadata:
+      labels:
+        app: agent-relay
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: wait-for-postgres
+          image: agent-relay:kind
+          imagePullPolicy: Never
+          env:
+            - name: RELAY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-local
+                  key: RELAY_DATABASE_URL
+          command: [python, -c]
+          args:
+            - |
+              import os
+              import time
+              from sqlalchemy import create_engine, text
+              from sqlalchemy.exc import OperationalError
+
+              engine = create_engine(os.environ["RELAY_DATABASE_URL"],
+                                     connect_args={"connect_timeout": 3})
+              for attempt in range(120):
+                  try:
+                      with engine.connect() as connection:
+                          connection.execute(text("SELECT 1"))
+                      break
+                  except OperationalError:
+                      time.sleep(2)
+              else:
+                  raise SystemExit("PostgreSQL did not become ready; retrying init container")
+              engine.dispose()
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      containers:
+        - name: app
+          image: agent-relay:kind
+          # Explicit kind load is required; never depend on a remote app registry.
+          imagePullPolicy: Never
+          env:
+            - name: RELAY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-local
+                  key: RELAY_DATABASE_URL
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-relay
+  namespace: agent-relay
+spec:
+  type: ClusterIP
+  selector:
+    app: agent-relay
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
