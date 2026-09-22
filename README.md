@@ -6,6 +6,141 @@ PostgreSQL; the self-contained local and single-container modes still support
 SQLite. Workers execute tasks on their own machines. The included worker
 deterministically returns `input.upper()`.
 
+## Test and deploy locally with act (Stage E)
+
+`.github/workflows/ci.yml` uses GitHub Actions syntax but is intentionally run
+locally through `act`. A GitHub-hosted runner cannot reach this local kind
+cluster; the workflow refuses execution outside act. No application registry,
+cloud account or GitHub token is needed. Check the existing tools first:
+
+```bash
+export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH" # macOS Docker Desktop, if needed
+docker version
+kind version
+kubectl version --client
+act --version
+uv --version
+```
+
+Do not run concurrent deployments to the same cluster. Bootstrap a dedicated
+cluster once using the Stage D commands below (including its initial app image,
+manifests and Ready checks). Keep that cluster and its PostgreSQL PVC across
+workflow runs. The examples below use `agent-relay`; substitute your dedicated
+cluster name consistently. Existing Compose/local databases are not used by CI.
+
+Build the local Linux runner, with a separate build context from the app's
+allowlisted `.dockerignore`:
+
+```bash
+docker build -t agent-relay-act:local ci/act-runner
+bash ci/run-act.sh agent-relay
+```
+
+The runner supplies Python 3.11.16, uv 0.12.9, Node 22.16.0, Docker CLI 28.0.4,
+kind 0.31.0 and kubectl 1.32.2. Tool downloads are versioned; kind and kubectl
+downloads are checksum-verified. It supports native Linux ARM64/AMD64 tools;
+Darwin host binaries are not mounted into Linux. These tools stay outside the
+production app image. First builds need access to upstream image/package/tool
+registries, and later runs still need any uncached Python packages.
+
+`ci/run-act.sh` requires an existing cluster and runner image. It makes a private
+temporary internal kubeconfig with `kind get kubeconfig --name "$CLUSTER"
+--internal`, mounts that file read-only, and joins Docker's `kind` network so
+the Kubernetes API hostname is reachable with certificate verification intact.
+It mounts the Docker socket so Linux Docker and kind can load images into the
+same local engine. It does not change the host kubeconfig, context or software.
+The wrapper's expanded invocation is:
+
+```bash
+XDG_CACHE_HOME=/tmp/agent-relay-act-cache act workflow_dispatch -W .github/workflows/ci.yml -j local-kind \
+  -P ubuntu-latest=agent-relay-act:local --pull=false \
+  --container-architecture "linux/$ARCH" --container-daemon-socket /var/run/docker.sock \
+  --network kind --container-options "--volume $RELAY_ACT_DIR/kubeconfig:/run/relay/kubeconfig:ro" \
+  --env KUBECONFIG=/run/relay/kubeconfig --env RELAY_KIND_CLUSTER="$CLUSTER" \
+  --env RELAY_CI_RUN="$RUN_VALUE" --action-cache-path /tmp/agent-relay-act-actions \
+  --no-cache-server --rm
+```
+
+The wrapper sets `ARCH` from the Docker server and creates a fresh UUID
+`RUN_VALUE` every time, including repeated runs of the same commit. act copies
+the candidate checkout into its runner. Start from a clean committed checkout
+for a deployable version; `GITHUB_SHA` identifies that commit. No host `.venv`
+is used: runner environments and caches live under `/tmp`.
+
+The single `local-kind` job runs sequential steps:
+
+1. Validate local execution, target cluster and unique candidate tag.
+2. Run `UV_FROZEN=1 uv run pytest -q` against the candidate (five existing SQLite tests).
+3. Start a disposable PostgreSQL container with tmpfs storage, then run
+   `RELAY_DATABASE_URL="$CI_POSTGRES_URL" UV_FROZEN=1 uv run python verify_postgres.py`
+   against candidate code (six checks including the accepted two-agent flow).
+   `CI_POSTGRES_URL` points to that CI-only container. The verifier additionally
+   uses its existing UUID schema isolation and cleanup. It never connects to or
+   resets the live Kubernetes database. The two suites use separate processes.
+4. Build `agent-relay:ci-<12-character-commit>-<32-character-run-UUID>`, recording
+   the exact image ID. Existing tags are rejected rather than overwritten.
+5. Run `kind load docker-image "$IMAGE" --name "$RELAY_KIND_CLUSTER"` and confirm
+   each kind node's image ID matches the built image.
+6. Run `kubectl --context "kind-$RELAY_KIND_CLUSTER" -n agent-relay set image
+   deployment/agent-relay app="$IMAGE" wait-for-postgres="$IMAGE"`, then
+   `kubectl --context "kind-$RELAY_KIND_CLUSTER" -n agent-relay rollout status
+   deployment/agent-relay --timeout=180s`. Verify the current observed generation,
+   one updated/Ready/available replica, both exact image references and `Never`
+   pull policies. The log records the Pod UID and runtime image IDs.
+7. Always remove only the disposable CI PostgreSQL container, if it was created.
+
+Every build/load/deploy step requires success of all preceding required tests.
+Test failure returns nonzero from act before building/loading/deploying the
+candidate. Cleanup never deletes the existing Deployment, StatefulSet, PVC or
+cluster. Rollout failure also returns nonzero; the workflow does not hide it
+or automatically delete workloads. The accepted one-replica `Recreate`
+strategy means a successful update has brief downtime. Do not reapply the
+generic `agent-relay:kind` app manifest between successful workflow runs.
+
+### Verify deployment and the failure gate
+
+After a successful run, use the Stage D port-forward and acceptance commands
+below. Restart port forwarding when the app Pod changes. Verify health/readiness,
+the visible heading, a real two-agent exchange, direct PostgreSQL records and
+previously retained results/PVC. The intentional later Homework version changes
+only the visible heading to `Agent Relay v2`, after independent initial workflow
+verification, and runs the same workflow against the same surviving cluster.
+
+To prove a required test prevents deployment, use an isolated local clone while
+the successful deployment is running. Run these commands from the real checkout
+with the Stage D temporary `KUBECONFIG` still set:
+
+```bash
+export RELAY_FAILURE_DIR="$(mktemp -d /tmp/agent-relay-failure.XXXXXX)"
+kubectl --context kind-agent-relay -n agent-relay get deployment agent-relay -o json > "$RELAY_FAILURE_DIR/deployment-before.json"
+kubectl --context kind-agent-relay -n agent-relay get pods -l app=agent-relay -o json > "$RELAY_FAILURE_DIR/pods-before.json"
+git clone --no-hardlinks . "$RELAY_FAILURE_DIR/candidate"
+git -C "$RELAY_FAILURE_DIR/candidate" remote set-url origin "$(git remote get-url origin)"
+printf 'def test_required_failure_gate():\n    assert False, "intentional isolated CI gate check"\n' > "$RELAY_FAILURE_DIR/candidate/test_required_failure_gate.py"
+(cd "$RELAY_FAILURE_DIR/candidate" && bash ci/run-act.sh agent-relay) > "$RELAY_FAILURE_DIR/act-failure.log" 2>&1
+# The previous command MUST exit nonzero. Inspect the log: pytest fails and
+# Build/Load/Update steps never execute; only CI database cleanup may run.
+kubectl --context kind-agent-relay -n agent-relay get deployment agent-relay -o json > "$RELAY_FAILURE_DIR/deployment-after.json"
+kubectl --context kind-agent-relay -n agent-relay get pods -l app=agent-relay -o json > "$RELAY_FAILURE_DIR/pods-after.json"
+cmp "$RELAY_FAILURE_DIR/deployment-before.json" "$RELAY_FAILURE_DIR/deployment-after.json"
+cmp "$RELAY_FAILURE_DIR/pods-before.json" "$RELAY_FAILURE_DIR/pods-after.json"
+```
+
+Confirm the same Deployment UID/generation/template/images and Ready Pod UID,
+and retrieve the same authenticated task result again. Only the disposable clone
+contains the failing test; do not commit it or edit the real tests. The workflow
+log prints each unique tag so the failed candidate's absence can be checked with
+`docker image inspect <failed-candidate-tag>`. Keep evidence outside the repository.
+Delete the temporary clone after review. Stop port forwarding and use the Stage D
+cluster cleanup only when its homework database is no longer needed; application
+updates themselves retain the cluster/PVC. CI PostgreSQL containers are removed
+automatically, and the wrapper removes its temporary kubeconfig. Built app images
+and the reusable `agent-relay-act:local` runner remain local.
+
+References: [act runner mapping and local images](https://nektosact.com/usage/runners.html),
+[act usage](https://nektosact.com/usage/index.html), and
+[kind image loading](https://kind.sigs.k8s.io/docs/user/quick-start/#loading-an-image-into-your-cluster).
+
 ## Run with PostgreSQL and local kind (Stage D)
 
 Start Docker Desktop/the Docker engine and make host port 8000 available.

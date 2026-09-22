@@ -1,0 +1,119 @@
+name: Local kind CI/CD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  local-kind:
+    # This job is deliberately executed by act, not a GitHub-hosted deployment.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      UV_FROZEN: "1"
+      UV_PROJECT_ENVIRONMENT: /tmp/relay-ci-venv
+      UV_CACHE_DIR: /tmp/relay-ci-uv-cache
+      UV_PYTHON_DOWNLOADS: never
+    steps:
+      - name: Check local execution
+        run: |
+          [[ "$ACT" == true ]] || { echo 'Run this workflow locally with ci/run-act.sh; GitHub runners cannot access local kind.' >&2; exit 1; }
+
+      - name: Candidate checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2; act copies this local checkout
+        with:
+          persist-credentials: false
+
+      - name: Validate target and reserve a unique image name
+        run: |
+          [[ "$RELAY_KIND_CLUSTER" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]]
+          [[ "$RELAY_CI_RUN" =~ ^[a-f0-9]{32}$ ]]
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          docker info >/dev/null
+          kind get clusters | grep -Fx "$RELAY_KIND_CLUSTER"
+          kubectl --context "kind-$RELAY_KIND_CLUSTER" -n agent-relay get deployment agent-relay >/dev/null
+          IMAGE="agent-relay:ci-${GITHUB_SHA:0:12}-$RELAY_CI_RUN"
+          if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "Refusing to reuse existing image $IMAGE" >&2
+            exit 1
+          fi
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "CI_POSTGRES_CONTAINER=relay-ci-pg-$RELAY_CI_RUN" >> "$GITHUB_ENV"
+          echo "Candidate: $GITHUB_SHA -> $IMAGE"
+
+      - name: Required starter tests
+        run: uv run pytest -q
+
+      - name: Required real PostgreSQL integration tests
+        run: |
+          docker run -d --rm --name "$CI_POSTGRES_CONTAINER" --network kind \
+            --tmpfs /var/lib/postgresql/data:rw \
+            -e POSTGRES_USER=relay_ci -e POSTGRES_PASSWORD=relay-ci-local-only -e POSTGRES_DB=relay_ci \
+            --health-cmd 'pg_isready -U relay_ci -d relay_ci' --health-interval 1s \
+            --health-timeout 3s --health-retries 60 postgres:17.11-bookworm
+          for attempt in $(seq 1 60); do
+            if [[ $(docker inspect -f '{{.State.Health.Status}}' "$CI_POSTGRES_CONTAINER") == healthy ]]; then break; fi
+            sleep 1
+          done
+          [[ $(docker inspect -f '{{.State.Health.Status}}' "$CI_POSTGRES_CONTAINER") == healthy ]]
+          # Separate process: pytest intentionally forces SQLite before imports.
+          RELAY_DATABASE_URL="postgresql+psycopg://relay_ci:relay-ci-local-only@$CI_POSTGRES_CONTAINER:5432/relay_ci" \
+            uv run python verify_postgres.py
+
+      - name: Build the tested application
+        run: |
+          docker build --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "$IMAGE" .
+          IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE")
+          echo "IMAGE_ID=$IMAGE_ID" >> "$GITHUB_ENV"
+          echo "Built $IMAGE $IMAGE_ID"
+
+      - name: Load exact image into kind
+        run: |
+          kind load docker-image "$IMAGE" --name "$RELAY_KIND_CLUSTER"
+          for node in $(kind get nodes --name "$RELAY_KIND_CLUSTER"); do
+            loaded=$(docker exec "$node" crictl inspecti "$IMAGE" | python -c 'import json,sys; print(json.load(sys.stdin)["status"]["id"])')
+            [[ "$loaded" == "$IMAGE_ID" ]] || { echo "Node image mismatch: $node $loaded != $IMAGE_ID" >&2; exit 1; }
+            echo "Loaded $node $IMAGE $loaded"
+          done
+
+      - name: Update app and init images and await rollout
+        run: |
+          kubectl --context "kind-$RELAY_KIND_CLUSTER" -n agent-relay set image deployment/agent-relay \
+            app="$IMAGE" wait-for-postgres="$IMAGE"
+          kubectl --context "kind-$RELAY_KIND_CLUSTER" -n agent-relay rollout status deployment/agent-relay --timeout=180s
+          python - <<'PY'
+          import json, os, subprocess
+          prefix = ['kubectl', '--context', 'kind-' + os.environ['RELAY_KIND_CLUSTER'], '-n', 'agent-relay']
+          def get(*args):
+              return json.loads(subprocess.check_output(prefix + list(args) + ['-o', 'json']))
+          deploy = get('get', 'deployment', 'agent-relay')
+          spec, status = deploy['spec'], deploy['status']
+          assert spec['replicas'] == 1 and spec['strategy']['type'] == 'Recreate'
+          assert status['observedGeneration'] >= deploy['metadata']['generation']
+          assert all(status.get(k) == 1 for k in ('replicas', 'updatedReplicas', 'readyReplicas', 'availableReplicas'))
+          template = spec['template']['spec']
+          assert all(c['image'] == os.environ['IMAGE'] and c['imagePullPolicy'] == 'Never'
+                     for c in template['containers'] + template['initContainers'])
+          pods = [p for p in get('get', 'pods', '-l', 'app=agent-relay')['items'] if not p['metadata'].get('deletionTimestamp')]
+          assert len(pods) == 1
+          pod = pods[0]
+          assert any(c['type'] == 'Ready' and c['status'] == 'True' for c in pod['status']['conditions'])
+          print(json.dumps({'commit': os.environ['GITHUB_SHA'], 'image': os.environ['IMAGE'],
+                            'docker_image_id': os.environ['IMAGE_ID'], 'generation': deploy['metadata']['generation'],
+                            'pod': pod['metadata']['name'], 'pod_uid': pod['metadata']['uid'],
+                            'runtime_images': [{k: c[k] for k in ('name', 'image', 'imageID')} for c in
+                                               pod['status']['initContainerStatuses'] + pod['status']['containerStatuses']],
+                            'ready': True}))
+          PY
+
+      - name: Remove only the disposable CI database
+        if: ${{ always() }}
+        run: |
+          if [[ -n "${CI_POSTGRES_CONTAINER:-}" ]] && docker container inspect "$CI_POSTGRES_CONTAINER" >/dev/null 2>&1; then
+            docker rm -f "$CI_POSTGRES_CONTAINER"
+          fi
