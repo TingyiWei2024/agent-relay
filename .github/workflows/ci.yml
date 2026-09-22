@@ -67,10 +67,10 @@ jobs:
 
       - name: Build the tested application
         run: |
-          docker buildx build --load --metadata-file /tmp/relay-ci-image.json \
+          docker buildx build --load \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "$IMAGE" .
           IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE")
-          IMAGE_CONFIG_DIGEST=$(python -c 'import json; print(json.load(open("/tmp/relay-ci-image.json"))["containerimage.config.digest"])')
+          IMAGE_CONFIG_DIGEST=$(docker image save "$IMAGE" | python ci/image-config-digest.py)
           echo "IMAGE_ID=$IMAGE_ID" >> "$GITHUB_ENV"
           echo "IMAGE_CONFIG_DIGEST=$IMAGE_CONFIG_DIGEST" >> "$GITHUB_ENV"
           echo "Built $IMAGE docker=$IMAGE_ID config=$IMAGE_CONFIG_DIGEST"

@@ -78,7 +78,7 @@ The single `local-kind` job runs sequential steps:
    uses its existing UUID schema isolation and cleanup. It never connects to or
    resets the live Kubernetes database. The two suites use separate processes.
 4. Build `agent-relay:ci-<12-character-commit>-<32-character-run-UUID>`, recording
-   the Docker image ID and BuildKit config digest. Existing tags are rejected
+   the Docker image ID and config digest from its local Docker archive. Existing tags are rejected
    rather than overwritten.
 5. Run `kind load docker-image "$IMAGE" --name "$RELAY_KIND_CLUSTER"` and confirm
    each kind node's CRI image ID matches the built config digest. Docker's
