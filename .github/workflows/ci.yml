@@ -67,17 +67,22 @@ jobs:
 
       - name: Build the tested application
         run: |
-          docker build --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "$IMAGE" .
+          docker buildx build --load --metadata-file /tmp/relay-ci-image.json \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "$IMAGE" .
           IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE")
+          IMAGE_CONFIG_DIGEST=$(python -c 'import json; print(json.load(open("/tmp/relay-ci-image.json"))["containerimage.config.digest"])')
           echo "IMAGE_ID=$IMAGE_ID" >> "$GITHUB_ENV"
-          echo "Built $IMAGE $IMAGE_ID"
+          echo "IMAGE_CONFIG_DIGEST=$IMAGE_CONFIG_DIGEST" >> "$GITHUB_ENV"
+          echo "Built $IMAGE docker=$IMAGE_ID config=$IMAGE_CONFIG_DIGEST"
 
       - name: Load exact image into kind
         run: |
           kind load docker-image "$IMAGE" --name "$RELAY_KIND_CLUSTER"
           for node in $(kind get nodes --name "$RELAY_KIND_CLUSTER"); do
             loaded=$(docker exec "$node" crictl inspecti "$IMAGE" | python -c 'import json,sys; print(json.load(sys.stdin)["status"]["id"])')
-            [[ "$loaded" == "$IMAGE_ID" ]] || { echo "Node image mismatch: $node $loaded != $IMAGE_ID" >&2; exit 1; }
+            # Docker's containerd store can report an OCI index as .Id; CRI
+            # reports the config digest. Compare the same kind of digest.
+            [[ "$loaded" == "$IMAGE_CONFIG_DIGEST" ]] || { echo "Node image mismatch: $node $loaded != $IMAGE_CONFIG_DIGEST" >&2; exit 1; }
             echo "Loaded $node $IMAGE $loaded"
           done
 
@@ -104,7 +109,8 @@ jobs:
           pod = pods[0]
           assert any(c['type'] == 'Ready' and c['status'] == 'True' for c in pod['status']['conditions'])
           print(json.dumps({'commit': os.environ['GITHUB_SHA'], 'image': os.environ['IMAGE'],
-                            'docker_image_id': os.environ['IMAGE_ID'], 'generation': deploy['metadata']['generation'],
+                            'docker_image_id': os.environ['IMAGE_ID'], 'config_digest': os.environ['IMAGE_CONFIG_DIGEST'],
+                            'generation': deploy['metadata']['generation'],
                             'pod': pod['metadata']['name'], 'pod_uid': pod['metadata']['uid'],
                             'runtime_images': [{k: c[k] for k in ('name', 'image', 'imageID')} for c in
                                                pod['status']['initContainerStatuses'] + pod['status']['containerStatuses']],

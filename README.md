@@ -78,9 +78,12 @@ The single `local-kind` job runs sequential steps:
    uses its existing UUID schema isolation and cleanup. It never connects to or
    resets the live Kubernetes database. The two suites use separate processes.
 4. Build `agent-relay:ci-<12-character-commit>-<32-character-run-UUID>`, recording
-   the exact image ID. Existing tags are rejected rather than overwritten.
+   the Docker image ID and BuildKit config digest. Existing tags are rejected
+   rather than overwritten.
 5. Run `kind load docker-image "$IMAGE" --name "$RELAY_KIND_CLUSTER"` and confirm
-   each kind node's image ID matches the built image.
+   each kind node's CRI image ID matches the built config digest. Docker's
+   containerd image store may report an OCI index digest as its image ID, so
+   comparing that index directly with CRI's config digest would be incorrect.
 6. Run `kubectl --context "kind-$RELAY_KIND_CLUSTER" -n agent-relay set image
    deployment/agent-relay app="$IMAGE" wait-for-postgres="$IMAGE"`, then
    `kubectl --context "kind-$RELAY_KIND_CLUSTER" -n agent-relay rollout status
