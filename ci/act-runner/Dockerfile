@@ -18,4 +18,3 @@ RUN curl -fsSL "https://github.com/kubernetes-sigs/kind/releases/download/v0.31.
     && chmod +x /usr/local/bin/kind /usr/local/bin/kubectl \
     && rm /tmp/kind.sha256 /tmp/kubectl.sha256
 ENV UV_PYTHON_DOWNLOADS=never
-

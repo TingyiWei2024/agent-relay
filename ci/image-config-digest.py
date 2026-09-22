@@ -24,4 +24,3 @@ match = re.fullmatch(r"(?:blobs/sha256/)?([0-9a-f]{64})(?:\.json)?", manifest[0]
 if match is None:
     raise SystemExit("Docker archive has an unrecognized config digest")
 print("sha256:" + match.group(1))
-
